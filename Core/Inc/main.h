@@ -39,7 +39,8 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
-
+extern TIM_HandleTypeDef htim1;
+extern DMA_HandleTypeDef hdma_tim1_ch1;
 /* USER CODE END ET */
 
 /* Exported constants --------------------------------------------------------*/
@@ -51,6 +52,8 @@ extern "C" {
 /* USER CODE BEGIN EM */
 
 /* USER CODE END EM */
+
+void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
@@ -68,6 +71,15 @@ void Error_Handler(void);
 #define RCC_OSC_IN_GPIO_Port GPIOF
 #define RCC_OSC_OUT_Pin GPIO_PIN_1
 #define RCC_OSC_OUT_GPIO_Port GPIOF
+#define button_gear_up_Pin GPIO_PIN_4
+#define button_gear_up_GPIO_Port GPIOA
+#define button_gear_up_EXTI_IRQn EXTI4_IRQn
+#define button_gear_down_Pin GPIO_PIN_6
+#define button_gear_down_GPIO_Port GPIOA
+#define button_gear_down_EXTI_IRQn EXTI9_5_IRQn
+#define button_clutch_Pin GPIO_PIN_7
+#define button_clutch_GPIO_Port GPIOA
+#define button_clutch_EXTI_IRQn EXTI9_5_IRQn
 #define T_SWDIO_Pin GPIO_PIN_13
 #define T_SWDIO_GPIO_Port GPIOA
 #define T_SWCLK_Pin GPIO_PIN_14

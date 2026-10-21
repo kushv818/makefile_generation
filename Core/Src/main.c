@@ -18,11 +18,14 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "stm32g4xx_hal_fdcan.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "led.h"
+#include "rev_match.h"
+#include "stm32g4xx_hal_gpio.h"
+#include "can.h"
+#include <stdint.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,24 +46,61 @@
 /* Private variables ---------------------------------------------------------*/
 
 COM_InitTypeDef BspCOMInit;
+ADC_HandleTypeDef hadc1;
+
 FDCAN_HandleTypeDef hfdcan1;
 FDCAN_HandleTypeDef hfdcan2;
 
+TIM_HandleTypeDef htim1;
+DMA_HandleTypeDef hdma_tim1_ch1;
+
 /* USER CODE BEGIN PV */
 
-uint32_t tracker = 0;
+
+//CAN debug variables
+uint32_t send_tracker = 0;
+volatile uint32_t receive_tracker = 0;
+volatile uint32_t tx_free_level;
+
 FDCAN_RxHeaderTypeDef RxHeader;
 uint8_t RxData[8];
 volatile uint8_t new_can_msg_flag = 0;
 bool isError = false;
+bool debounce_prevented = false;
+
+uint8_t tx_fifo_full_error = 0;     // Flips to 1 when TX FIFO runs out of room
+uint32_t tx_fail_count = 0;         // Tracks total failed transmission attempts
+uint32_t fdcan_last_error_code = 0; // Captures HAL error return value
+
+//led strip variables
+uint16_t led_index = 20;
+
+//adc variables
+uint32_t adc_val;
+
+//rev match global variable instantiation
+uint8_t current_gear = FIRST_GEAR;
+uint32_t current_speed; // in mph
+uint16_t current_rpm;
+bool clutch = false; //true indicates pedal pressed, false indicates pedal not pressed
+uint8_t fall_rate = 1;
+uint32_t last_fall_time = 0;
+
+uint8_t gear_polarity = 1;
+
+volatile VehicleData_t test_struct = {0};
+
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_FDCAN1_Init(void);
 static void MX_FDCAN2_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -99,8 +139,11 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_FDCAN1_Init();
   MX_FDCAN2_Init();
+  MX_TIM1_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -125,35 +168,65 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  FDCAN_FilterTypeDef sFilterConfig;
+  CAN_App_Init();
+  
 
-/* Configure standard 11-bit ID filter to accept all incoming messages into FIFO 0 */
-sFilterConfig.IdType       = FDCAN_STANDARD_ID;
-sFilterConfig.FilterIndex  = 0;
-sFilterConfig.FilterType   = FDCAN_FILTER_MASK;
-sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-sFilterConfig.FilterID1    = 0x000;              // Base ID
-sFilterConfig.FilterID2    = 0x000;              // Mask 0x000 accepts all IDs
-
-if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
-{
-  Error_Handler();
-}
-
-/* Activate notification when a new message arrives in Rx FIFO 0 */
-if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK)
-{
-  Error_Handler();
-}
-
-/* Start the FDCAN module */
-if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
-{
-  Error_Handler();
-}
-
+HAL_ADC_Start(&hadc1);
   while (1)
   {
+    //rev_match demo    
+    // Static variable to remember the last filtered value across loop iterations
+//     static uint32_t smoothed_adc = 0;
+
+//     // Grab raw potentiometer value
+//     uint32_t raw_adc = HAL_ADC_GetValue(&hadc1);
+
+//     if (smoothed_adc == 0) {
+//     smoothed_adc = raw_adc; // Initialize on first run
+//     } else {
+//     // Low-pass filter: 7/8 old value + 1/8 new value
+//     // Increase the divisor (e.g., to 16) for more smoothing, decrease for faster response
+//     smoothed_adc = (smoothed_adc * 15 + raw_adc) / 16;
+// }
+
+// // Translate the smoothed value to RPM
+// current_rpm = ((smoothed_adc * 8000) / 4096);
+//     //calculate current_wheelspeed from current_rpm IF CLUTCH NOT PRESSED
+//     if(!clutch) //speed is a function of rpm
+//       current_speed = ((float)current_rpm * 80.0f) / (1056.0f * gear_ratios[current_gear] * 4.1f);
+//     else{
+//       uint32_t current_time = HAL_GetTick();
+//       if (current_time - last_fall_time >= 200) // Drops by 1 every 100ms
+//       {
+//         if (current_speed > 0) 
+//         {
+//           current_speed--;
+//         }
+//         last_fall_time = current_time;
+//       }
+//     }
+
+    //now finally call rev_match update function
+    CAN_GetLatestData(&test_struct);
+    current_rpm = test_struct.engine_rpm;
+    clutch = test_struct.clutch_pressed;
+    current_gear = test_struct.current_gear;
+    //take back right wheel speed as true speed for now
+    //if(!clutch)
+      current_speed = test_struct.br_speed;
+    //else 
+    //  current_speed = calculate_speed_from_rpm(current_rpm, current_gear);
+    rev_match_update();
+
+    //potentiometer test
+    //adc_val = HAL_ADC_GetValue(&hadc1);
+    /* Scale 0-4095 to valid LED indices */
+    //uint16_t target_led = (uint16_t)(((uint32_t)adc_val * NUM_LEDS) >> 12);
+    //if (target_led >= NUM_LEDS) target_led = NUM_LEDS - 1;
+    //SK6812_Clear_All_LED();
+    //SK6812_SetLED(target_led, 0, 40, 40);
+    //SK6812_Update();
+
 
     /* USER CODE END WHILE */
 
@@ -173,7 +246,7 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
-  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -184,7 +257,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
-  RCC_OscInitStruct.PLL.PLLN = 85;
+  RCC_OscInitStruct.PLL.PLLN = 80;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
@@ -198,14 +271,82 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV2;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.GainCompensation = 0;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -227,18 +368,18 @@ HAL_NVIC_EnableIRQ(FDCAN1_IT0_IRQn);
   hfdcan1.Instance = FDCAN1;
   hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
-  hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
-  hfdcan1.Init.AutoRetransmission = DISABLE;
+  hfdcan1.Init.Mode = FDCAN_MODE_EXTERNAL_LOOPBACK;
+  hfdcan1.Init.AutoRetransmission = ENABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
-  hfdcan1.Init.NominalPrescaler = 16;
+  hfdcan1.Init.NominalPrescaler = 8;
   hfdcan1.Init.NominalSyncJumpWidth = 1;
-  hfdcan1.Init.NominalTimeSeg1 = 1;
-  hfdcan1.Init.NominalTimeSeg2 = 1;
+  hfdcan1.Init.NominalTimeSeg1 = 15;
+  hfdcan1.Init.NominalTimeSeg2 = 4;
   hfdcan1.Init.DataPrescaler = 1;
   hfdcan1.Init.DataSyncJumpWidth = 1;
-  hfdcan1.Init.DataTimeSeg1 = 1;
-  hfdcan1.Init.DataTimeSeg2 = 1;
+  hfdcan1.Init.DataTimeSeg1 = 15;
+  hfdcan1.Init.DataTimeSeg2 = 4;
   hfdcan1.Init.StdFiltersNbr = 0;
   hfdcan1.Init.ExtFiltersNbr = 0;
   hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
@@ -270,18 +411,18 @@ static void MX_FDCAN2_Init(void)
   hfdcan2.Instance = FDCAN2;
   hfdcan2.Init.ClockDivider = FDCAN_CLOCK_DIV1;
   hfdcan2.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
-  hfdcan2.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
+  hfdcan2.Init.Mode = FDCAN_MODE_BUS_MONITORING;
   hfdcan2.Init.AutoRetransmission = DISABLE;
   hfdcan2.Init.TransmitPause = DISABLE;
   hfdcan2.Init.ProtocolException = DISABLE;
-  hfdcan2.Init.NominalPrescaler = 16;
+  hfdcan2.Init.NominalPrescaler = 8;
   hfdcan2.Init.NominalSyncJumpWidth = 1;
-  hfdcan2.Init.NominalTimeSeg1 = 1;
-  hfdcan2.Init.NominalTimeSeg2 = 1;
+  hfdcan2.Init.NominalTimeSeg1 = 15;
+  hfdcan2.Init.NominalTimeSeg2 = 4;
   hfdcan2.Init.DataPrescaler = 1;
   hfdcan2.Init.DataSyncJumpWidth = 1;
-  hfdcan2.Init.DataTimeSeg1 = 1;
-  hfdcan2.Init.DataTimeSeg2 = 1;
+  hfdcan2.Init.DataTimeSeg1 = 15;
+  hfdcan2.Init.DataTimeSeg2 = 4;
   hfdcan2.Init.StdFiltersNbr = 0;
   hfdcan2.Init.ExtFiltersNbr = 0;
   hfdcan2.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
@@ -296,12 +437,102 @@ static void MX_FDCAN2_Init(void)
 }
 
 /**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 99;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.BreakAFMode = TIM_BREAK_AFMODE_INPUT;
+  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
+  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+  sBreakDeadTimeConfig.Break2Filter = 0;
+  sBreakDeadTimeConfig.Break2AFMode = TIM_BREAK_AFMODE_INPUT;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMAMUX1_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -309,8 +540,27 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pins : button_gear_up_Pin button_gear_down_Pin */
+  GPIO_InitStruct.Pin = button_gear_up_Pin|button_gear_down_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : button_clutch_Pin */
+  GPIO_InitStruct.Pin = button_clutch_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(button_clutch_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -319,15 +569,49 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+/* USER CODE BEGIN 4 */
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  uint32_t current_time = HAL_GetTick();
+  static uint32_t button_last = 0;
+
+  if(current_time-button_last > 50){ //can do this since we know all interrupts are buttons
+    if (GPIO_Pin == button_clutch_Pin){
+        clutch = HAL_GPIO_ReadPin(button_clutch_GPIO_Port, button_clutch_Pin) == GPIO_PIN_SET;
+    }
+    else if (GPIO_Pin == button_gear_up_Pin){
+      if(current_gear != SIXTH_GEAR) {current_gear++;}
+    }
+    else if (GPIO_Pin == button_gear_down_Pin){
+      if (current_gear != FIRST_GEAR) {current_gear--;}
+    }
+    
+    button_last = current_time;
+    BSP_LED_Toggle(LED_GREEN);
+  }
+}
+
+
 void BSP_PB_Callback(Button_TypeDef Button)
 {
-if (Button == BUTTON_USER)
-  {
-    FDCAN_TxHeaderTypeDef TxHeader;
-    uint8_t TxData[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+  static uint32_t last_press_time = 0;
+  uint32_t current_time = HAL_GetTick();
 
-    /* 1. Configure Header for a Classical Standard 11-bit Frame */
-    TxHeader.Identifier          = 0x123;
+  if (Button == BUTTON_USER)
+  {
+    /* Ignore mechanical bounces within 50 ms */
+    if ((current_time - last_press_time) < 50)
+    {
+      debounce_prevented = true;
+      return;
+    }
+    last_press_time = current_time;
+
+    FDCAN_TxHeaderTypeDef TxHeader;
+    uint8_t TxData[8] = {0x03, 0x3B, 0xA7, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+    TxHeader.Identifier          = 0x7C0;
     TxHeader.IdType              = FDCAN_STANDARD_ID;
     TxHeader.TxFrameType         = FDCAN_DATA_FRAME;
     TxHeader.DataLength          = FDCAN_DLC_BYTES_8;
@@ -337,31 +621,23 @@ if (Button == BUTTON_USER)
     TxHeader.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
     TxHeader.MessageMarker       = 0;
 
-    /* 2. Push message into Tx FIFO */
-    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader, TxData) != HAL_OK)
+    /* Check free space before queueing */
+    if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan2) > 0)
     {
-      Error_Handler();
+      if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader, TxData) == HAL_OK){
+        send_tracker++;
+        
+        tx_free_level = HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan2);
+      }
     }
-    tracker++;
-    BSP_LED_Toggle(LED_GREEN);
+    else
+    {
+      tx_fifo_full_error = 1;
+      tx_fail_count++;
+    }
   }
 }
 
-void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
-{
-  if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != 0)
-  {
-    /* Pull the received message out of FIFO 0 */
-    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
-    {
-      new_can_msg_flag = 1;
-      
-      // Visual verification: Toggle green LED when a frame arrives
-      //BSP_LED_Toggle(LED_GREEN);
-      tracker++;
-    }
-  }
-}
 
 /* USER CODE END 4 */
 
@@ -398,5 +674,3 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
-

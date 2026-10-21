@@ -20,5 +20,9 @@
                 "samplesPerSecond": 4
             }
         }
-    ]
+    ],
+    "liveWatch": {
+        "enabled": true,
+        "samplesPerSecond": "4"
+      }
 }
